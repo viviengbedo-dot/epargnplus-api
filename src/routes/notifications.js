@@ -42,4 +42,30 @@ router.patch('/:id/read', requireAuth, async (req, res) => {
   }
 });
 
+// PATCH /notifications/read-all
+router.patch('/read-all', requireAuth, async (req, res) => {
+  try {
+    await query(
+      'UPDATE notifications SET read = TRUE WHERE user_id = $1 AND read = FALSE',
+      [req.user.uid]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /notifications/unread-count
+router.get('/unread-count', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND read = FALSE',
+      [req.user.uid]
+    );
+    res.json({ success: true, data: { count: parseInt(rows[0].count) } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;
