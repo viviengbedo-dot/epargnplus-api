@@ -519,4 +519,100 @@ router.patch('/transactions/:id/reject', requireAdmin, async (req, res, next) =>
   }
 });
 
+// ─── KYC Review ──────────────────────────────────────────────────────────────
+
+// GET /admin/kyc?page=1  — list users with pending KYC + their docs
+router.get('/kyc', requireAdmin, async (req, res, next) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const offset = (page - 1) * PAGE_SIZE;
+
+    const [rows, countRow] = await Promise.all([
+      query(
+        `SELECT u.id, u.phone, u.name, u.kyc_status, u.kyc_tier, u.created_at,
+                json_agg(json_build_object(
+                  'id', kd.id, 'type', kd.type,
+                  'verified', kd.verified, 'uploadedAt', kd.uploaded_at
+                ) ORDER BY kd.uploaded_at) FILTER (WHERE kd.id IS NOT NULL) as docs
+         FROM users u
+         LEFT JOIN kyc_documents kd ON kd.user_id = u.id
+         WHERE u.kyc_status IN ('pending','verified')
+         GROUP BY u.id
+         ORDER BY u.created_at DESC
+         LIMIT $1 OFFSET $2`,
+        [PAGE_SIZE, offset]
+      ),
+      query(`SELECT COUNT(*) as total FROM users WHERE kyc_status IN ('pending','verified')`),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        items: rows.rows.map((u) => ({
+          id: u.id,
+          phone: u.phone,
+          name: u.name || '',
+          kycStatus: u.kyc_status,
+          kycTier: u.kyc_tier,
+          createdAt: new Date(u.created_at).toLocaleDateString('fr-FR'),
+          docs: u.docs || [],
+        })),
+        total: parseInt(countRow.rows[0].total),
+        page,
+        totalPages: Math.ceil(parseInt(countRow.rows[0].total) / PAGE_SIZE),
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/kyc/:userId/docs  — get docs WITH images for review
+router.get('/kyc/:userId/docs', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, type, file_url, verified, uploaded_at
+       FROM kyc_documents WHERE user_id = $1 ORDER BY uploaded_at`,
+      [req.params.userId]
+    );
+    res.json({
+      success: true,
+      data: rows.map((d) => ({
+        id: d.id,
+        type: d.type,
+        fileUrl: d.file_url,
+        verified: d.verified,
+        uploadedAt: new Date(d.uploaded_at).toLocaleDateString('fr-FR'),
+      })),
+    });
+  } catch (err) { next(err); }
+});
+
+// PATCH /admin/kyc/:userId/approve
+router.patch('/kyc/:userId/approve', requireAdmin, async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    await query(
+      `UPDATE users SET kyc_status = 'verified', kyc_tier = 2 WHERE id = $1`,
+      [userId]
+    );
+    await query(
+      `UPDATE kyc_documents SET verified = true WHERE user_id = $1`,
+      [userId]
+    );
+    res.json({ success: true, message: 'KYC approuvé.' });
+  } catch (err) { next(err); }
+});
+
+// PATCH /admin/kyc/:userId/reject
+router.patch('/kyc/:userId/reject', requireAdmin, async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    await query(
+      `UPDATE users SET kyc_status = 'none', kyc_tier = 1 WHERE id = $1`,
+      [userId]
+    );
+    await query(`DELETE FROM kyc_documents WHERE user_id = $1`, [userId]);
+    res.json({ success: true, message: 'KYC rejeté, documents supprimés.' });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

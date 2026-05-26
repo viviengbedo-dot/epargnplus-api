@@ -100,6 +100,18 @@ CREATE TABLE IF NOT EXISTS referrals (
 -- Admin: is_blocked column (added after initial schema)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT FALSE;
 
+-- Personal info (v2)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS city VARCHAR(100);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS profession VARCHAR(100);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_income NUMERIC(12,2);
+
+-- Project deadline (v2)
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS deadline DATE;
+
+-- KYC unique constraint (v2)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kyc_user_type ON kyc_documents(user_id, type);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC);

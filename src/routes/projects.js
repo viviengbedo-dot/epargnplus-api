@@ -6,7 +6,7 @@ const { requireAuth } = require('../middleware/auth');
 router.get('/', requireAuth, async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT id, name, icon, current_amount, goal_amount, status, created_at
+      `SELECT id, name, icon, current_amount, goal_amount, status, deadline, created_at
        FROM projects
        WHERE user_id = $1
        ORDER BY created_at DESC`,
@@ -20,6 +20,7 @@ router.get('/', requireAuth, async (req, res) => {
       currentAmount: parseFloat(p.current_amount),
       goalAmount: parseFloat(p.goal_amount),
       status: p.status,
+      deadline: p.deadline ? new Date(p.deadline).toISOString().split('T')[0] : null,
       createdAt: new Date(p.created_at).toLocaleDateString('fr-FR', {
         day: '2-digit', month: 'short', year: 'numeric',
       }),
@@ -34,17 +35,17 @@ router.get('/', requireAuth, async (req, res) => {
 // POST /projects
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const { name, goalAmount, icon } = req.body;
+    const { name, goalAmount, icon, deadline } = req.body;
 
     if (!name || !goalAmount || goalAmount <= 0) {
       return res.status(400).json({ success: false, message: 'Nom et objectif requis.' });
     }
 
     const { rows } = await query(
-      `INSERT INTO projects (user_id, name, icon, goal_amount)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, name, icon, current_amount, goal_amount, status, created_at`,
-      [req.user.uid, name.trim(), icon || 'target', goalAmount]
+      `INSERT INTO projects (user_id, name, icon, goal_amount, deadline)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, icon, current_amount, goal_amount, status, deadline, created_at`,
+      [req.user.uid, name.trim(), icon || 'target', goalAmount, deadline || null]
     );
 
     const p = rows[0];
@@ -57,6 +58,7 @@ router.post('/', requireAuth, async (req, res) => {
         currentAmount: parseFloat(p.current_amount),
         goalAmount: parseFloat(p.goal_amount),
         status: p.status,
+        deadline: p.deadline ? new Date(p.deadline).toISOString().split('T')[0] : null,
         createdAt: new Date(p.created_at).toLocaleDateString('fr-FR', {
           day: '2-digit', month: 'short', year: 'numeric',
         }),
