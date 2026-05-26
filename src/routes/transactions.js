@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { query } = require('../db');
+const { query, pool } = require('../db');
 const { requireAuth } = require('../middleware/auth');
 const crypto = require('crypto');
 
@@ -47,7 +47,7 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-// POST /transactions/deposit
+// POST /transactions/deposit — creates PENDING, returns merchant number + instructions
 router.post('/deposit', requireAuth, async (req, res) => {
   try {
     const { amount, mobileOperator, phone, projectId } = req.body;
@@ -59,69 +59,54 @@ router.post('/deposit', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Opérateur et numéro requis.' });
     }
 
-    // In production: initiate Mobile Money payment here, wait for webhook.
-    // For now: direct credit (demo / test mode).
-    const client = await (require('../db').pool).connect();
-    try {
-      await client.query('BEGIN');
+    const reference = 'DEP-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+    const merchantNumber = getMerchantNumber(mobileOperator);
 
-      const reference = 'DEP-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+    await query(
+      `INSERT INTO transactions
+         (user_id, type, amount, operator, phone, project_id, status, reference, label)
+       VALUES ($1, 'deposit', $2, $3, $4, $5, 'pending', $6, $7)`,
+      [
+        req.user.uid,
+        amount,
+        mobileOperator,
+        phone,
+        projectId || null,
+        reference,
+        `Dépôt ${operatorLabel(mobileOperator)}`,
+      ]
+    );
 
-      const { rows: txRows } = await client.query(
-        `INSERT INTO transactions
-           (user_id, type, amount, operator, phone, project_id, status, reference, label)
-         VALUES ($1, 'deposit', $2, $3, $4, $5, 'success', $6, $7)
-         RETURNING id`,
-        [req.user.uid, amount, mobileOperator, phone, projectId || null, reference,
-         `Dépôt ${operatorLabel(mobileOperator)}`]
-      );
+    const amountFormatted = parseFloat(amount).toLocaleString('fr-FR');
 
-      // Credit wallet
-      await client.query(
-        'UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id = $2',
-        [amount, req.user.uid]
-      );
-
-      // Credit project if provided
-      if (projectId) {
-        await client.query(
-          `UPDATE projects SET current_amount = current_amount + $1,
-           status = CASE WHEN current_amount + $1 >= goal_amount THEN 'COMPLETED' ELSE status END
-           WHERE id = $2 AND user_id = $3`,
-          [amount, projectId, req.user.uid]
-        );
-      }
-
-      await client.query('COMMIT');
-
-      res.json({
-        success: true,
-        data: {
-          transactionId: txRows[0].id,
-          reference,
-          status: 'success',
-          message: 'Dépôt effectué avec succès.',
-        },
-      });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    res.json({
+      success: true,
+      data: {
+        reference,
+        status: 'pending',
+        merchantNumber,
+        operatorLabel: operatorLabel(mobileOperator),
+        amount: parseFloat(amount),
+        instructions: `Envoyez ${amountFormatted} GNF au ${merchantNumber} via ${operatorLabel(mobileOperator)}. Mettez la référence ${reference} dans le motif du paiement.`,
+        message: 'Demande enregistrée. Envoyez le paiement pour confirmer.',
+      },
+    });
   } catch (err) {
     console.error('[deposit]', err.message);
     res.status(err.status || 500).json({ success: false, message: err.message });
   }
 });
 
-// POST /transactions/withdrawal
-router.post('/withdrawal', requireAuth, async (req, res) => {
+// POST /transactions/withdraw + /withdrawal — creates PENDING, reserves balance
+async function handleWithdraw(req, res) {
   try {
     const { amount, mobileOperator, phone } = req.body;
 
     if (!amount || amount <= 0) {
       return res.status(400).json({ success: false, message: 'Montant invalide.' });
+    }
+    if (!mobileOperator || !phone) {
+      return res.status(400).json({ success: false, message: 'Opérateur et numéro requis.' });
     }
 
     // Check balance
@@ -130,32 +115,37 @@ router.post('/withdrawal', requireAuth, async (req, res) => {
       [req.user.uid]
     );
     const balance = parseFloat(walletRows[0]?.balance || 0);
-    const fee = amount * 0.01;
+    const fee = Math.round(amount * 0.01);
     const total = amount + fee;
 
     if (balance < total) {
       return res.status(400).json({
         success: false,
-        message: `Solde insuffisant. Disponible: ${balance.toLocaleString('fr-FR')} GNF.`,
+        message: `Solde insuffisant. Disponible: ${balance.toLocaleString('fr-FR')} GNF (frais 1% inclus).`,
       });
     }
 
-    const client = await (require('../db').pool).connect();
+    const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
       const reference = 'WTH-' + crypto.randomBytes(4).toString('hex').toUpperCase();
 
-      const { rows: txRows } = await client.query(
+      await client.query(
         `INSERT INTO transactions
            (user_id, type, amount, operator, phone, status, reference, label)
-         VALUES ($1, 'withdrawal', $2, $3, $4, 'success', $5, $6)
-         RETURNING id`,
-        [req.user.uid, amount, mobileOperator, phone, reference,
-         `Retrait ${operatorLabel(mobileOperator)}`]
+         VALUES ($1, 'withdrawal', $2, $3, $4, 'pending', $5, $6)`,
+        [
+          req.user.uid,
+          amount,
+          mobileOperator,
+          phone,
+          reference,
+          `Retrait ${operatorLabel(mobileOperator)}`,
+        ]
       );
 
-      // Debit wallet (amount + fee)
+      // Reserve balance (deduct immediately)
       await client.query(
         'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2',
         [total, req.user.uid]
@@ -166,10 +156,12 @@ router.post('/withdrawal', requireAuth, async (req, res) => {
       res.json({
         success: true,
         data: {
-          transactionId: txRows[0].id,
           reference,
-          status: 'success',
-          message: 'Retrait effectué avec succès.',
+          status: 'pending',
+          amount: parseFloat(amount),
+          fee,
+          total,
+          message: 'Demande de retrait enregistrée. Traitement sous 15–30 minutes.',
         },
       });
     } catch (err) {
@@ -179,10 +171,24 @@ router.post('/withdrawal', requireAuth, async (req, res) => {
       client.release();
     }
   } catch (err) {
-    console.error('[withdrawal]', err.message);
+    console.error('[withdraw]', err.message);
     res.status(err.status || 500).json({ success: false, message: err.message });
   }
-});
+}
+
+router.post('/withdrawal', requireAuth, handleWithdraw);
+router.post('/withdraw', requireAuth, handleWithdraw);
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function getMerchantNumber(operator) {
+  const map = {
+    'orange-money': process.env.ORANGE_MONEY_NUMBER || '+224 621 000 000',
+    'mtn-momo': process.env.MTN_MOMO_NUMBER || '+224 660 000 000',
+    'wave': process.env.WAVE_NUMBER || '+224 628 000 000',
+  };
+  return map[operator] || map['orange-money'];
+}
 
 function operatorLabel(key) {
   const map = {
@@ -190,6 +196,9 @@ function operatorLabel(key) {
     'mtn-momo': 'MTN MoMo',
     'wave': 'Wave Guinée',
     'visa': 'Visa',
+    // Legacy IDs
+    'orange': 'Orange Money',
+    'mtn': 'MTN MoMo',
   };
   return map[key] || key;
 }

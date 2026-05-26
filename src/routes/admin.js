@@ -411,4 +411,112 @@ router.get('/export/transactions.csv', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// PATCH /admin/transactions/:id/confirm
+router.patch('/transactions/:id/confirm', requireAdmin, async (req, res, next) => {
+  const client = await (require('../db').pool).connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      'SELECT * FROM transactions WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Transaction introuvable.' });
+    }
+
+    const tx = rows[0];
+
+    if (tx.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Transaction déjà traitée.' });
+    }
+
+    // Mark as success
+    await client.query(
+      'UPDATE transactions SET status = $1 WHERE id = $2',
+      ['success', tx.id]
+    );
+
+    // Deposits: credit wallet (and project if applicable)
+    if (tx.type === 'deposit') {
+      await client.query(
+        'UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id = $2',
+        [tx.amount, tx.user_id]
+      );
+
+      if (tx.project_id) {
+        await client.query(
+          `UPDATE projects
+           SET current_amount = current_amount + $1,
+               status = CASE WHEN current_amount + $1 >= goal_amount THEN 'COMPLETED' ELSE status END
+           WHERE id = $2`,
+          [tx.amount, tx.project_id]
+        );
+      }
+    }
+    // Withdrawals: balance already reserved at creation — nothing to do
+
+    await client.query('COMMIT');
+    res.json({ success: true, data: { id: tx.id, status: 'success' } });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /admin/transactions/:id/reject
+router.patch('/transactions/:id/reject', requireAdmin, async (req, res, next) => {
+  const client = await (require('../db').pool).connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      'SELECT * FROM transactions WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Transaction introuvable.' });
+    }
+
+    const tx = rows[0];
+
+    if (tx.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Transaction déjà traitée.' });
+    }
+
+    // Mark as failed
+    await client.query(
+      'UPDATE transactions SET status = $1 WHERE id = $2',
+      ['failed', tx.id]
+    );
+
+    // Withdrawals: refund reserved balance (amount + 1% fee)
+    if (tx.type === 'withdrawal') {
+      const fee = Math.round(parseFloat(tx.amount) * 0.01);
+      const total = parseFloat(tx.amount) + fee;
+      await client.query(
+        'UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id = $2',
+        [total, tx.user_id]
+      );
+    }
+    // Deposits: never credited — nothing to reverse
+
+    await client.query('COMMIT');
+    res.json({ success: true, data: { id: tx.id, status: 'failed' } });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
