@@ -254,4 +254,161 @@ router.get('/projects', requireAdmin, async (req, res, next) => {
   }
 });
 
+// GET /admin/users/:id — user detail
+router.get('/users/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT u.*, COALESCE(w.balance, 0) as balance, COALESCE(u.is_blocked, false) as is_blocked
+       FROM users u LEFT JOIN wallets w ON w.user_id = u.id
+       WHERE u.id = $1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Utilisateur introuvable.' });
+    const u = rows[0];
+    res.json({
+      success: true,
+      data: {
+        id: u.id, phone: u.phone, name: u.name || '',
+        balance: parseFloat(u.balance), kycStatus: u.kyc_status,
+        kycTier: u.kyc_tier, referralCode: u.referral_code,
+        isBlocked: u.is_blocked,
+        createdAt: new Date(u.created_at).toLocaleDateString('fr-FR'),
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/users/:id/transactions
+router.get('/users/:id/transactions', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT t.*, u.phone as user_phone FROM transactions t
+       JOIN users u ON u.id = t.user_id
+       WHERE t.user_id = $1 ORDER BY t.created_at DESC LIMIT 50`,
+      [req.params.id]
+    );
+    res.json({
+      success: true,
+      data: {
+        items: rows.map((t) => ({
+          id: t.id, userId: t.user_id, userPhone: t.user_phone,
+          type: t.type, amount: parseFloat(t.amount),
+          operator: t.operator || '', status: t.status,
+          reference: t.reference,
+          createdAt: new Date(t.created_at).toLocaleDateString('fr-FR'),
+        })),
+        total: rows.length,
+      },
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /admin/notifications/send — send to single user
+router.post('/notifications/send', requireAdmin, async (req, res, next) => {
+  try {
+    const { userId, title, body } = req.body;
+    if (!userId || !title || !body) {
+      return res.status(400).json({ success: false, message: 'userId, title et body requis.' });
+    }
+    await query(
+      `INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)`,
+      [userId, title, body]
+    );
+    res.json({ success: true, data: { sent: 1 } });
+  } catch (err) { next(err); }
+});
+
+// POST /admin/notifications/broadcast — send to all or active users
+router.post('/notifications/broadcast', requireAdmin, async (req, res, next) => {
+  try {
+    const { title, body, target } = req.body;
+    if (!title || !body) {
+      return res.status(400).json({ success: false, message: 'title et body requis.' });
+    }
+    let userIds;
+    if (target === 'active') {
+      const { rows } = await query(
+        `SELECT DISTINCT user_id FROM auth_tokens WHERE expires_at > NOW()`
+      );
+      userIds = rows.map((r) => r.user_id);
+    } else {
+      const { rows } = await query(`SELECT id FROM users`);
+      userIds = rows.map((r) => r.id);
+    }
+    if (userIds.length === 0) {
+      return res.json({ success: true, data: { count: 0 } });
+    }
+    const values = userIds.map((id, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`).join(',');
+    const params = userIds.flatMap((id) => [id, title, body]);
+    await query(`INSERT INTO notifications (user_id, title, body) VALUES ${values}`, params);
+    res.json({ success: true, data: { count: userIds.length } });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/export/users.csv
+router.get('/export/users.csv', async (req, res, next) => {
+  try {
+    const token = req.query.token;
+    if (!token) return res.status(401).json({ success: false, message: 'Token manquant.' });
+    const jwt = require('jsonwebtoken');
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.role !== 'admin') return res.status(403).json({ success: false, message: 'Accès refusé.' });
+
+    const { rows } = await query(
+      `SELECT u.phone, u.name, u.kyc_status, u.kyc_tier, u.referral_code,
+              COALESCE(w.balance, 0) as balance, u.created_at
+       FROM users u LEFT JOIN wallets w ON w.user_id = u.id
+       ORDER BY u.created_at DESC`
+    );
+
+    const header = 'Téléphone,Nom,KYC,Tier,Parrainage,Solde (GNF),Inscrit le\n';
+    const csv = header + rows.map((u) =>
+      [u.phone, u.name || '', u.kyc_status, u.kyc_tier, u.referral_code,
+       parseFloat(u.balance).toFixed(2),
+       new Date(u.created_at).toLocaleDateString('fr-FR')].join(',')
+    ).join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="epargnplus_users.csv"');
+    res.send('﻿' + csv);
+  } catch (err) { next(err); }
+});
+
+// GET /admin/export/transactions.csv
+router.get('/export/transactions.csv', async (req, res, next) => {
+  try {
+    const token = req.query.token;
+    if (!token) return res.status(401).json({ success: false, message: 'Token manquant.' });
+    const jwt = require('jsonwebtoken');
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.role !== 'admin') return res.status(403).json({ success: false, message: 'Accès refusé.' });
+
+    const type = req.query.type || '';
+    const status = req.query.status || '';
+    const conditions = [];
+    const params = [];
+    if (type) { params.push(type); conditions.push(`t.type = $${params.length}`); }
+    if (status) { params.push(status); conditions.push(`t.status = $${params.length}`); }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const { rows } = await query(
+      `SELECT t.reference, u.phone, t.type, t.amount, t.operator, t.status, t.created_at
+       FROM transactions t JOIN users u ON u.id = t.user_id
+       ${where} ORDER BY t.created_at DESC`,
+      params
+    );
+
+    const header = 'Référence,Téléphone,Type,Montant (GNF),Opérateur,Statut,Date\n';
+    const csv = header + rows.map((t) =>
+      [t.reference, t.phone, t.type, parseFloat(t.amount).toFixed(2),
+       t.operator || '', t.status,
+       new Date(t.created_at).toLocaleDateString('fr-FR')].join(',')
+    ).join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="epargnplus_transactions.csv"');
+    res.send('﻿' + csv);
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
