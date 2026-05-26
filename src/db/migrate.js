@@ -97,6 +97,9 @@ CREATE TABLE IF NOT EXISTS referrals (
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Admin: is_blocked column (added after initial schema)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT FALSE;
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC);

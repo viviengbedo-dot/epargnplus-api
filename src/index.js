@@ -14,6 +14,8 @@ app.use(cors({
   origin: [
     'https://epargnplus.com',
     'https://www.epargnplus.com',
+    'https://epargnplus-web.vercel.app',
+    /\.vercel\.app$/,
     /localhost/,
   ],
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
@@ -46,6 +48,7 @@ v1.use('/transactions',  require('./routes/transactions'));
 v1.use('/projects',      require('./routes/projects'));
 v1.use('/notifications', require('./routes/notifications'));
 v1.use('/referral',      require('./routes/referral'));
+v1.use('/admin',         require('./routes/admin'));
 
 app.use('/v1', v1);
 
