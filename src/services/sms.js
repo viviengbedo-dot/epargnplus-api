@@ -61,14 +61,33 @@ async function sendOTP(phone) {
 
   // Send via AfricasTalking
   const sms = getAT().SMS;
-  await sms.send({
+  const sendOptions = {
     to: [`+${normalizedPhone}`],
-    message: `Votre code Epargn+ : ${code}. Valable ${process.env.OTP_TTL_MINUTES || 10} minutes. Ne le partagez jamais.`,
-    from: process.env.AT_SENDER_ID || 'EpargnPlus',
+    message: `Epargn+ - Code: ${code}. Valable ${process.env.OTP_TTL_MINUTES || 10} min. Ne le partagez pas.`,
+  };
+
+  // Only add sender ID if explicitly set (leave empty to use AT default shortcode)
+  if (process.env.AT_SENDER_ID) {
+    sendOptions.from = process.env.AT_SENDER_ID;
+  }
+
+  const result = await sms.send(sendOptions);
+  const recipients = result?.SMSMessageData?.Recipients || [];
+
+  // Log AT delivery status for each recipient
+  recipients.forEach((r) => {
+    if (r.statusCode === 101) {
+      console.log(`[SMS] OTP sent to +${normalizedPhone} — cost: ${r.cost}`);
+    } else {
+      console.error(`[SMS] FAILED to +${normalizedPhone} — status: ${r.status} (${r.statusCode})`);
+    }
   });
 
-  console.log(`[SMS] OTP sent to +${normalizedPhone}`);
-  return { sent: true };
+  if (!recipients.length) {
+    console.error(`[SMS] No recipients in AT response:`, JSON.stringify(result));
+  }
+
+  return { sent: true, recipients };
 }
 
 async function verifyOTP(phone, code) {
