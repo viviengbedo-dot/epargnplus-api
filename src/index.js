@@ -51,6 +51,8 @@ v1.use('/transactions',  require('./routes/transactions'));
 v1.use('/projects',      require('./routes/projects'));
 v1.use('/notifications', require('./routes/notifications'));
 v1.use('/referral',      require('./routes/referral'));
+v1.use('/support',       require('./routes/support'));
+v1.use('/promos',        require('./routes/promos'));
 v1.use('/admin',         require('./routes/admin'));
 
 app.use('/v1', v1);

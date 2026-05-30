@@ -615,4 +615,351 @@ router.patch('/kyc/:userId/reject', requireAdmin, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+/* ══════════════════════════════════════════════════
+   SUPPORT TICKETS — admin
+   ══════════════════════════════════════════════════ */
+
+// GET /admin/support — liste tous les tickets
+router.get('/support', requireAdmin, async (req, res, next) => {
+  try {
+    const { status, priority, page = 1 } = req.query;
+    const offset = (parseInt(page) - 1) * PAGE_SIZE;
+    const conditions = [];
+    const params = [];
+
+    if (status)   { params.push(status);   conditions.push(`st.status = $${params.length}`); }
+    if (priority) { params.push(priority); conditions.push(`st.priority = $${params.length}`); }
+
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    const { rows } = await query(
+      `SELECT st.id, st.subject, st.message, st.status, st.priority, st.category,
+              st.admin_reply, st.resolved_at, st.created_at, st.updated_at,
+              u.phone, u.name
+       FROM support_tickets st
+       JOIN users u ON u.id = st.user_id
+       ${where}
+       ORDER BY
+         CASE st.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
+         st.created_at DESC
+       LIMIT ${PAGE_SIZE} OFFSET $${params.length + 1}`,
+      [...params, offset]
+    );
+
+    /* Counts */
+    const { rows: counts } = await query(
+      `SELECT status, COUNT(*) as cnt FROM support_tickets GROUP BY status`
+    );
+    const stats = Object.fromEntries(counts.map((r) => [r.status, parseInt(r.cnt)]));
+
+    res.json({ success: true, data: rows, stats });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/support/:id — détail + réponses
+router.get('/support/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows: tRows } = await query(
+      `SELECT st.*, u.phone, u.name
+       FROM support_tickets st
+       JOIN users u ON u.id = st.user_id
+       WHERE st.id = $1`,
+      [req.params.id]
+    );
+    if (!tRows.length) return res.status(404).json({ success: false, message: 'Ticket introuvable.' });
+
+    const { rows: replies } = await query(
+      `SELECT id, message, is_admin, created_at FROM ticket_replies
+       WHERE ticket_id = $1 ORDER BY created_at ASC`,
+      [req.params.id]
+    );
+
+    res.json({ success: true, data: { ...tRows[0], replies } });
+  } catch (err) { next(err); }
+});
+
+// POST /admin/support/:id/reply — répondre à un ticket
+router.post('/support/:id/reply', requireAdmin, async (req, res, next) => {
+  try {
+    const { message, newStatus, newPriority } = req.body;
+    if (!message && !newStatus && !newPriority) {
+      return res.status(400).json({ success: false, message: 'message, newStatus ou newPriority requis.' });
+    }
+
+    const VALID_STATUS   = ['open','in_progress','resolved','closed'];
+    const VALID_PRIORITY = ['low','normal','high','urgent'];
+
+    if (newStatus && !VALID_STATUS.includes(newStatus)) {
+      return res.status(400).json({ success: false, message: 'status invalide.' });
+    }
+
+    /* Récupérer le ticket pour notifier l'utilisateur */
+    const { rows: tRows } = await query(
+      `SELECT id, user_id, subject FROM support_tickets WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!tRows.length) return res.status(404).json({ success: false, message: 'Ticket introuvable.' });
+    const ticket = tRows[0];
+
+    /* Insérer la réponse */
+    if (message) {
+      await query(
+        `INSERT INTO ticket_replies (ticket_id, author_id, message, is_admin) VALUES ($1, NULL, $2, TRUE)`,
+        [req.params.id, message.slice(0, 2000)]
+      );
+    }
+
+    /* Mettre à jour le ticket */
+    const updates = ['updated_at = NOW()'];
+    const params  = [req.params.id];
+    if (message)      { params.push(message.slice(0, 2000)); updates.push(`admin_reply = $${params.length}`); }
+    if (newStatus)    { params.push(newStatus);  updates.push(`status = $${params.length}`); }
+    if (newPriority && VALID_PRIORITY.includes(newPriority)) {
+      params.push(newPriority); updates.push(`priority = $${params.length}`);
+    }
+    if (newStatus === 'resolved') updates.push('resolved_at = NOW()');
+
+    await query(`UPDATE support_tickets SET ${updates.join(', ')} WHERE id = $1`, params);
+
+    /* Notifier l'utilisateur */
+    if (message) {
+      await query(
+        `INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)`,
+        [ticket.user_id,
+         '💬 Réponse à votre demande',
+         `Votre demande "${ticket.subject}" a reçu une réponse de l'équipe Epargn+.`]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+// PATCH /admin/support/:id/status — changer statut/priorité uniquement
+router.patch('/support/:id/status', requireAdmin, async (req, res, next) => {
+  try {
+    const { status, priority } = req.body;
+    const VALID_STATUS   = ['open','in_progress','resolved','closed'];
+    const VALID_PRIORITY = ['low','normal','high','urgent'];
+
+    if (status && !VALID_STATUS.includes(status)) {
+      return res.status(400).json({ success: false, message: 'status invalide.' });
+    }
+
+    const updates = ['updated_at = NOW()'];
+    const params  = [req.params.id];
+    if (status)   { params.push(status);   updates.push(`status = $${params.length}`); }
+    if (priority && VALID_PRIORITY.includes(priority)) {
+      params.push(priority); updates.push(`priority = $${params.length}`);
+    }
+    if (status === 'resolved') updates.push('resolved_at = NOW()');
+
+    await query(`UPDATE support_tickets SET ${updates.join(', ')} WHERE id = $1`, params);
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+/* ══════════════════════════════════════════════════
+   PROMO CODES — admin
+   ══════════════════════════════════════════════════ */
+
+// GET /admin/promos — liste tous les codes
+router.get('/promos', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, code, description, type, value, currency, max_uses, uses_count,
+              target_country, active, expires_at, created_at
+       FROM promo_codes
+       ORDER BY created_at DESC`
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) { next(err); }
+});
+
+// POST /admin/promos — créer un code promo
+router.post('/promos', requireAdmin, async (req, res, next) => {
+  try {
+    const { code, description, type, value, currency, max_uses, target_country, expires_at } = req.body;
+    if (!code || !type || value === undefined) {
+      return res.status(400).json({ success: false, message: 'code, type et value requis.' });
+    }
+    const VALID_TYPES = ['bonus_deposit','fee_free','cashback'];
+    if (!VALID_TYPES.includes(type)) {
+      return res.status(400).json({ success: false, message: 'type invalide.' });
+    }
+
+    const { rows } = await query(
+      `INSERT INTO promo_codes (code, description, type, value, currency, max_uses, target_country, expires_at)
+       VALUES (UPPER($1), $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        code.trim(), description || '', type, parseFloat(value),
+        currency || 'GNF',
+        max_uses ? parseInt(max_uses) : null,
+        target_country || null,
+        expires_at || null,
+      ]
+    );
+    res.status(201).json({ success: true, data: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ success: false, message: 'Ce code promo existe déjà.' });
+    }
+    next(err);
+  }
+});
+
+// PATCH /admin/promos/:id — activer/désactiver
+router.patch('/promos/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const { active } = req.body;
+    if (active === undefined) {
+      return res.status(400).json({ success: false, message: 'active requis.' });
+    }
+    await query(`UPDATE promo_codes SET active = $1 WHERE id = $2`, [Boolean(active), req.params.id]);
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+// DELETE /admin/promos/:id — supprimer
+router.delete('/promos/:id', requireAdmin, async (req, res, next) => {
+  try {
+    await query(`DELETE FROM promo_uses WHERE promo_id = $1`, [req.params.id]);
+    await query(`DELETE FROM promo_codes WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/promos/:id/uses — qui a utilisé ce code
+router.get('/promos/:id/uses', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT pu.id, pu.amount, pu.used_at, u.phone, u.name
+       FROM promo_uses pu
+       JOIN users u ON u.id = pu.user_id
+       WHERE pu.promo_id = $1
+       ORDER BY pu.used_at DESC`,
+      [req.params.id]
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) { next(err); }
+});
+
+/* ══════════════════════════════════════════════════
+   BROADCAST — version améliorée avec enregistrement
+   ══════════════════════════════════════════════════ */
+
+// POST /admin/broadcast — envoyer + enregistrer
+router.post('/broadcast', requireAdmin, async (req, res, next) => {
+  try {
+    const { title, body: msgBody, target } = req.body;
+    if (!title || !msgBody) {
+      return res.status(400).json({ success: false, message: 'title et body requis.' });
+    }
+
+    /* Sélectionner les utilisateurs selon la cible */
+    /* iOS n'a pas de colonne country — 'active' = tokens valides, sinon tous */
+    let userIds = [];
+    if (target === 'active') {
+      const { rows } = await query(
+        `SELECT DISTINCT user_id FROM auth_tokens WHERE expires_at > NOW()`
+      );
+      userIds = rows.map((r) => r.user_id);
+    } else {
+      const { rows } = await query(`SELECT id FROM users WHERE is_blocked = FALSE`);
+      userIds = rows.map((r) => r.id);
+    }
+
+    if (!userIds.length) {
+      return res.json({ success: true, data: { count: 0 } });
+    }
+
+    /* Insérer les notifications en batch */
+    const values = userIds.map((_, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`).join(',');
+    const params = userIds.flatMap((id) => [id, title, msgBody]);
+    await query(`INSERT INTO notifications (user_id, title, body) VALUES ${values}`, params);
+
+    /* Enregistrer le broadcast */
+    try {
+      await query(
+        `INSERT INTO broadcasts (title, message, target, sent_count, created_by) VALUES ($1, $2, $3, $4, 'admin')`,
+        [title, msgBody, target || 'all', userIds.length]
+      );
+    } catch (e) { /* table optionnelle */ }
+
+    res.json({ success: true, data: { count: userIds.length } });
+  } catch (err) { next(err); }
+});
+
+// GET /admin/broadcast/history — historique des broadcasts
+router.get('/broadcast/history', requireAdmin, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, title, message, target, sent_count, created_at
+       FROM broadcasts
+       ORDER BY created_at DESC
+       LIMIT 50`
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    /* Table optionnelle — retourner tableau vide si absente */
+    res.json({ success: true, data: [] });
+  }
+});
+
+/* ══════════════════════════════════════════════════
+   PILOT CHECKLIST — endpoint de santé globale
+   ══════════════════════════════════════════════════ */
+
+// GET /admin/health — santé de la plateforme pour la checklist pilote
+router.get('/health', requireAdmin, async (req, res, next) => {
+  try {
+    const [users, txns, promos, tickets, wallets] = await Promise.all([
+      query(`SELECT COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE kyc_status = 'verified') as kyc_verified
+             FROM users`),
+      query(`SELECT COUNT(*) FILTER (WHERE status = 'success') as completed,
+                    COUNT(*) FILTER (WHERE status = 'pending') as pending
+             FROM transactions`),
+      query(`SELECT COUNT(*) FILTER (WHERE active) as active FROM promo_codes`).catch(() => ({ rows: [{ active: 0 }] })),
+      query(`SELECT COUNT(*) FILTER (WHERE status = 'open') as open,
+                    COUNT(*) FILTER (WHERE status = 'in_progress') as in_progress
+             FROM support_tickets`).catch(() => ({ rows: [{ open: 0, in_progress: 0 }] })),
+      query(`SELECT SUM(balance) as total FROM wallets`),
+    ]);
+
+    const checks = {
+      hasUsers:          parseInt(users.rows[0].total) >= 1,
+      hasKycVerified:    parseInt(users.rows[0].kyc_verified) >= 1,
+      hasCompletedTxn:   parseInt(txns.rows[0].completed) >= 1,
+      hasActivePromo:    parseInt(promos.rows[0].active) >= 1,
+      adminEmailSet:     !!process.env.ADMIN_EMAIL,
+      jwtSecretSet:      !!process.env.JWT_SECRET,
+      dbConnected:       true,
+    };
+
+    const passed = Object.values(checks).filter(Boolean).length;
+    const total  = Object.keys(checks).length;
+
+    res.json({
+      success: true,
+      data: {
+        checks,
+        passed,
+        total,
+        ready: passed === total,
+        stats: {
+          users:       parseInt(users.rows[0].total),
+          kycVerified: parseInt(users.rows[0].kyc_verified),
+          completedTxn:parseInt(txns.rows[0].completed),
+          pendingTxn:  parseInt(txns.rows[0].pending),
+          totalSavings:parseFloat(wallets.rows[0].total || 0),
+          activePromos:parseInt(promos.rows[0].active),
+          openTickets: parseInt(tickets.rows[0].open || 0),
+        },
+      },
+    });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
